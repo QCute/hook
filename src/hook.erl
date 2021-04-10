@@ -40,33 +40,42 @@ hook(Module, Function, Arity, CallbackModule, CallbackFunction) ->
     File = code:which(Module),
     {_, _, Chunks} = beam_lib:all_chunks(File),
     {_, {_, [{atoms, Atoms}, {indexed_imports, Imports}, {"CInf", CompileInfoChunk}, {"Code", Code}]}} = beam_lib:chunks(File, [atoms, indexed_imports, "CInf", "Code"]),
-    %% remove native
-    CompileInfo = binary_to_term(CompileInfoChunk),
-    Options = proplists:get_value(options, CompileInfo, []),
-    NewCompileInfo = term_to_binary(lists:keyreplace(options, 1, CompileInfo, {options, lists:delete(native, Options)})),
+    %% decode code
+    <<_:32, _:32, _:32, _:32, _:32, Bytes/binary>> = Code,
+    List = decode_code(#state{bytes = Bytes, atoms = gb_trees:from_orddict(Atoms)}, []),
+    %% find label offset
+    Offset = match_label(List, Module, Function, Arity),
+    %% previous hooks
+    Hooks = proplists:get_value(hooks, proplists:get_value(options, Module:module_info(compile), []), []),
     %% rebuild atom and import dict
     AtomsDict = setelement(2, beam_dict:new(), lists:foldl(fun({I, A}, M) -> maps:put(A, I, M) end, maps:new(), Atoms)),
+    %% build origin import
     ImportsDict = lists:foldl(fun({_, M, F, A}, D) -> element(2, beam_dict:import(M, F, A, D)) end, AtomsDict, Imports),
-    {ImportIndex, Dict} = beam_dict:import(CallbackModule, CallbackFunction, Arity, ImportsDict),
+    %% build previous import (keep ordered, reverse order in compile info options)
+    NewImportDict = lists:foldl(fun({M, F, A, I, _}, D) -> {X, R} = beam_dict:import(M, F, A, D), I =/= X andalso exit({confused_index, M, F, A, I, X}), R end, ImportsDict, lists:reverse(Hooks)),
+    {ImportIndex, Dict} = beam_dict:import(CallbackModule, CallbackFunction, Arity, NewImportDict),
+    %% update compile info
+    CompileInfo = binary_to_term(CompileInfoChunk),
+    Options = proplists:get_value(options, CompileInfo, []),
+    %% remove native
+    NewOptions = lists:delete(native, Options),
+    %% update hooks
+    NewHooks = [{CallbackModule, CallbackFunction, Arity, ImportIndex, Offset} | Hooks],
+    %% save hooks info in compile info options
+    NewestOptions = lists:keystore(hooks, 1, NewOptions, {hooks, NewHooks}),
+    %% update options
+    NewCompileInfo = lists:keyreplace(options, 1, CompileInfo, {options, NewestOptions}),
+    NewCompileInfoChunk = term_to_binary(NewCompileInfo),
     %% rebuild atom table
     {NumberAtoms, AtomTable} = beam_dict:atom_table(Dict, utf8),
     AtomChunk = <<NumberAtoms:32, (iolist_to_binary(AtomTable))/binary>>,
     %% rebuild import table
     {NumberExports, ImportTable} = beam_dict:import_table(Dict),
     ImportChunk = <<NumberExports:32, (<<<<F:32, A:32, L:32>> || {F, A, L} <- ImportTable>>)/binary>>,
-    %% rebuild code
-    <<SubSize:32, _:32, OpCodeMax:32, NumberLabels:32, NumberFunctions:32, Bytes/binary>> = Code,
-    List = decode_code(#state{bytes = Bytes, atoms = gb_trees:from_orddict(Atoms)}, []),
-    Offset = match_label(List, Module, Function, Arity),
-    Offset =:= 0 andalso exit({function_label_not_found, Module, Function, Arity}),
-    <<Head:Offset/binary-unit:8, Tail/binary>> = Bytes,
-    %% build code
-    CallLabel = <<(beam_opcodes:opcode(call_ext_only, 2)):8, (list_to_binary([beam_asm:encode(?tag_u, Arity)]))/binary, (list_to_binary([beam_asm:encode(?tag_u, ImportIndex)]))/binary>>,
-    Label = <<(beam_opcodes:opcode(label, 1)):8, (list_to_binary([beam_asm:encode(?tag_u, NumberLabels)]))/binary>>,
-    CodeHeader = <<SubSize:32, (beam_opcodes:format_number()):32, (max(OpCodeMax, beam_opcodes:opcode(call_ext_only, 2))):32, (NumberLabels + 1):32, NumberFunctions:32>>,
-    CodeChunk = <<CodeHeader/binary, Head/binary, CallLabel/binary, Label/binary, Tail/binary>>,
+    %% build label with previous hook (offset order by asc)
+    CodeChunk = build_label_loop(lists:keysort(5, NewHooks), 0, Code),
     %% replace chunks
-    ReplaceCompileInfoChunks = lists:keyreplace("CInf", 1, Chunks, {"CInf", NewCompileInfo}),
+    ReplaceCompileInfoChunks = lists:keyreplace("CInf", 1, Chunks, {"CInf", NewCompileInfoChunk}),
     ReplaceAtomChunks = lists:keyreplace("AtU8", 1, ReplaceCompileInfoChunks, {"AtU8", AtomChunk}),
     ReplaceImportChunks = lists:keyreplace("ImpT", 1, ReplaceAtomChunks, {"ImpT", ImportChunk}),
     ReplaceCodeChunks = lists:keyreplace("Code", 1, ReplaceImportChunks, {"Code", CodeChunk}),
@@ -89,9 +98,25 @@ unload(Module) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+build_label_loop([], _, Code) ->
+    Code;
+build_label_loop([{_, _, Arity, ImportIndex, Offset} | T], TotalOffset, Code) ->
+    %% calc multi target offset
+    ThisOffset = Offset + TotalOffset,
+    %% previous code
+    <<SubSize:32, _:32, OpCodeMax:32, NumberLabels:32, NumberFunctions:32, Head:ThisOffset/binary-unit:8, Tail/binary>> = Code,
+    %% build label
+    CallLabel = <<(beam_opcodes:opcode(call_ext_only, 2)):8, (list_to_binary([beam_asm:encode(?tag_u, Arity)]))/binary, (list_to_binary([beam_asm:encode(?tag_u, ImportIndex)]))/binary>>,
+    Label = <<(beam_opcodes:opcode(label, 1)):8, (list_to_binary([beam_asm:encode(?tag_u, NumberLabels)]))/binary>>,
+    %% rebuild code header
+    CodeHeader = <<SubSize:32, (beam_opcodes:format_number()):32, (max(OpCodeMax, beam_opcodes:opcode(call_ext_only, 2))):32, (NumberLabels + 1):32, NumberFunctions:32>>,
+    %% update code
+    CodeChunk = <<CodeHeader/binary, Head/binary, CallLabel/binary, Label/binary, Tail/binary>>,
+    build_label_loop(T, TotalOffset + byte_size(CallLabel) + byte_size(Label), CodeChunk).
+
 %% find function label
-match_label([], _, _, _) ->
-    0;
+match_label([], Module, Function, Arity) ->
+    exit({function_label_not_found, Module, Function, Arity});
 match_label([#term{name = func_info, data = [#term{name = atom, data = Module}, #term{name = atom, data = Function}, #term{name = integer, data = Arity}]}, #term{name = label}, #term{offset = Offset} | _], Module, Function, Arity) ->
     %% label next term start offset
     Offset - 1;
