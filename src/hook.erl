@@ -48,7 +48,12 @@ hook(Module, Function, Arity, CallbackModule, CallbackFunction) ->
     %% previous hooks
     Hooks = proplists:get_value(hooks, proplists:get_value(options, Module:module_info(compile), []), []),
     %% rebuild atom and import dict
-    AtomsDict = setelement(2, beam_dict:new(), lists:foldl(fun({I, A}, M) -> maps:put(A, I, M) end, maps:new(), Atoms)),
+    case erlang:system_info(otp_release) > "17" of
+        true ->
+            AtomsDict = setelement(2, beam_dict:new(), lists:foldl(fun({I, A}, M) -> maps:put(A, I, M) end, maps:new(), Atoms));
+        false ->
+            AtomsDict = setelement(2, beam_dict:new(), lists:foldl(fun({I, A}, M) -> gb_trees:insert(A, I, M) end, gb_trees:empty(), Atoms))
+    end,
     %% build origin import
     ImportsDict = lists:foldl(fun({_, M, F, A}, D) -> element(2, beam_dict:import(M, F, A, D)) end, AtomsDict, Imports),
     %% build previous import (keep ordered, reverse order in compile info options)
@@ -67,7 +72,12 @@ hook(Module, Function, Arity, CallbackModule, CallbackFunction) ->
     NewCompileInfo = lists:keyreplace(options, 1, CompileInfo, {options, NewestOptions}),
     NewCompileInfoChunk = term_to_binary(NewCompileInfo),
     %% rebuild atom table
-    {NumberAtoms, AtomTable} = beam_dict:atom_table(Dict, utf8),
+    case erlang:function_exported(beam_dict, atom_table, 2) of
+        true ->
+            {NumberAtoms, AtomTable} = beam_dict:atom_table(Dict, utf8);
+        false ->
+            {NumberAtoms, AtomTable} = beam_dict:atom_table(Dict)
+    end,
     AtomChunk = <<NumberAtoms:32, (iolist_to_binary(AtomTable))/binary>>,
     %% rebuild import table
     {NumberExports, ImportTable} = beam_dict:import_table(Dict),
@@ -132,7 +142,7 @@ decode_code(State = #state{offset = Offset, bytes = Bytes}, List) ->
     decode_code(NewState, [Term | List]).
 
 decode_instr(State = #state{offset = Offset, first = First}) ->
-    {SymOp, Arity} = bo:opname(First),
+    {SymOp, Arity} = beam_opcodes:opname(First),
     case SymOp of
         select_val ->
             decode_select(select_val, State);
@@ -176,9 +186,8 @@ decode_number_term(Number, State, List) ->
 %% decode term with tag
 decode_tag_term(State = #state{offset = Offset, bytes = Bytes}) ->
     <<_:Offset/binary-unit:8, First:8, _/binary>> = Bytes,
-    Flag = case erlang:list_to_integer(erlang:system_info(otp_release)) >= 20 of true -> 1; false -> 0 end,
     Index = First band 2#111,
-    Tag = case Index >= 7 of true -> 6 + (First bsr 4) + Flag; false -> Index end,
+    Tag = case Index >= 7 of true -> 6 + (First bsr 4) + 1; false -> Index end,
     Tag >= ?TAG_UNKNOWN andalso exit({unknown, tag, Tag, State}),
     decode_term(State#state{tag = Tag, offset = Offset + 1, first = First}).
 
