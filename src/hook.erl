@@ -98,7 +98,7 @@ hook(Module, Function, Arity, CallbackModule, CallbackFunction) ->
     code:load_binary(Module, File, Binary).
 
 %% @doc unload hook module
--spec unload(Module :: module()) -> boolean().
+-spec unload(Module :: module()) -> {module, module()} | {error, term()}.
 unload(Module) ->
     code:unstick_mod(Module),
     File = code:which(Module),
@@ -156,6 +156,12 @@ decode_instr(State = #state{offset = Offset, first = First}) ->
             decode_map(get_map_elements, Arity, State);
         has_map_fields ->
             decode_map(has_map_fields, Arity, State);
+        put_tuple2 ->
+            decode_put_tuple(put_tuple2, State);
+        make_fun3 ->
+            decode_make_fun(make_fun3, State);
+        init_yregs ->
+            decode_init_yregs(init_yregs, State);
         _ ->
             {NewState, List} = decode_number_term(Arity, State, []),
             NewState#state{term = #term{name = SymOp, data = List, offset = Offset}}
@@ -175,6 +181,24 @@ decode_map(Name, Arity, State = #state{offset = Offset}) ->
     {FinalState, SecondList} = decode_number_term(Length, NewestState, []),
     Term = #term{name = Name, data = A ++ [{Z, U, SecondList}], offset = Offset},
     FinalState#state{term = Term}.
+
+decode_put_tuple(Name, State = #state{offset = Offset}) ->
+    {NewState, [X, Z, U = #term{data = Length}]} = decode_number_term(3, State, []),
+    {NewestState, List} = decode_number_term(Length, NewState, []),
+    Term = #term{name = Name, data = [X, {Z, U, List}], offset = Offset},
+    NewestState#state{term = Term}.
+
+decode_make_fun(Name, State = #state{offset = Offset}) ->
+    {NewState, [Fun, Dst, Z, U = #term{data = Length}]} = decode_number_term(4, State, []),
+    {NewestState, List} = decode_number_term(Length, NewState, []),
+    Term = #term{name = Name, data = [Fun, Dst, {Z, U, List}], offset = Offset},
+    NewestState#state{term = Term}.
+
+decode_init_yregs(Name, State = #state{offset = Offset}) ->
+    {NewState, [Z, U = #term{data = Length}]} = decode_number_term(2, State, []),
+    {NewestState, List} = decode_number_term(Length, NewState, []),
+    Term = #term{name = Name, data = [{Z, U, List}], offset = Offset},
+    NewestState#state{term = Term}.
 
 %% decode number of term
 decode_number_term(0, State, List) ->
